@@ -1,0 +1,1447 @@
+User
+the qa pipeline is like below 
+///
+/// Jenkinsfile for Streaming QA pipelines.
+///
+/// Copyright 2016-2023 Cloud Software Group, Inc.
+///
+
+@Library('workflowLibs')
+
+// Library access
+//
+
+def alert = new  com.tibco.workflow.Alert()
+def artifactory = new  com.tibco.workflow.Artifactory()
+def jobUtil = new  com.tibco.workflow.JobUtil()
+def pomUtil = new  com.tibco.workflow.PomUtil()
+def epscm = new  com.tibco.workflow.SCM()
+
+// Defaults
+if (!platform) {
+    platform = jobUtil.defaultPlatformFromPipeline()
+}
+
+// Needed to reconcile osx for macos on olde jobs. QA jobs must still be run with Java 8
+// even on Streaming versions that require Java 11, so the job platform isn't the same
+// as the platform variable in the case of macOS (macos vs. the old osx).
+def qaJobPlatform = jobUtil.getLegacyPipelinePlatformPart(platform)
+def jobPlatform = platform
+
+// Globals
+//
+// If we have to use Java 8 for qa, we need to change the loop below.
+def qaJDKVersion = jobUtil.getOracleJava8Tool() // not actually used, just a reminder
+def jdkVersion = jobUtil.getOracleJava17Tool()
+def pipeline = "qa"
+def upstreamPipeline = "studio"
+
+def linuxLabel = "( o.almalinux8 || o.centos8 || o.rh8 )"
+
+// The big QA job that runs devtest and Studio GUI tests.
+// No label for Jubula yet.
+def qaBuildLabel = jobUtil.getStrBuildLabelOrNull(
+    platform,
+    "c.unix-tools && c.devtest", // all qa. tests use devtest
+    [ linux: "${linuxLabel} && a.x86_64", macos: "o.macos && a.x86_64", windows: "c.UTF-8-locale-configured && c.windows-10-compatible && o.windows && a.x86_64" ])
+
+// Github samples use VC 12 on Windows for native features.
+// On Linux and macOS, the cloud samples can run if Docker is present along with an Ansible installation compatible
+// with 2.8.
+// If Docker is present but Ansible is not, that's not enough. Thus the -> "implies" syntax.
+// Not yet forcing Docker -- we could, by changing the -> to &&, or even do it _conditionally_.
+def samplesBuildLabel = jobUtil.getStrBuildLabelOrNull(
+    platform,
+    "c.unix-tools",
+    [ linux: "${linuxLabel} && a.x86_64 && (c.docker-compatible-linux-3.10 -> c.ansible-2.8-compatible)",
+     macos: "o.macos && a.x86_64 && (c.docker-compatible-linux-3.10 -> c.ansible-2.8-compatible)",
+     windows: "c.ms-toolset-v120 && c.windows-10-compatible && o.windows && a.x86_64" ])
+
+// More accomodation for GitHub samples: default the branch here.
+String use_branch_githubsamples = "master"
+
+if (branch_githubsamples) {
+    use_branch_githubsamples = branch_githubsamples
+}
+
+echo "Using specified GitHub samples branch ${use_branch_githubsamples}"
+
+// Build steps: including per-step mavenExtras and branch.
+//
+def steps = []
+// Switches to Java 17+platform variant in Streaming 11.1
+steps.add(["github-samples.java17." + jobPlatform,            [ use_branch_githubsamples, mavenExtras_githubsamples, samplesBuildLabel, skip_githubsamples ]])
+steps.add(["qa." + qaJobPlatform,                        [ branch_qa, mavenExtras_qa, qaBuildLabel, skip_qa ]])
+
+// Reference pom to test if we are building a release or not
+//
+def pomVersion = ""
+
+// Needed so we can use a GitHub samples branch that doesn't match this tested version.
+// Replaces project_version parameter in QA pipelines for 10.4.
+def streamingVersion = ""
+
+// SCM for polling
+//
+node (jobUtil.getJenkinsBuiltInNodeLabel()) {
+    // Can't rely on tibco-streaming-samples for the Streaming version under test; use qa
+    // even though we run it second.
+    git branch: use_branch_githubsamples, credentialsId: epscm.getCodelineCredentialsId('tibco-streaming-samples'), url: epscm.getCodelineUrl('tibco-streaming-samples')
+    git branch: branch_qa,  credentialsId: epscm.getCodelineCredentialsId('ep-streaming-qa'), url: epscm.getCodelineUrl('ep-streaming-qa')
+
+    if (fileExists('pom.xml')) {
+        pomVersion = pomUtil.getPomVersion('pom.xml')
+        streamingVersion = pomUtil.getPomProperty('pom.xml', 'sb.version')
+    }
+}
+
+// Save an executor map just for the main node.
+Map mainExecutorMap = [:]
+jobUtil.noteMainExecutor(currentBuild, mainExecutorMap)
+
+// Announce start after all sources have been checked out.
+alert.jobBuildStartAlert(
+    job: currentBuild, jobUtil: jobUtil,
+    jobParameters: currentBuild.getBuildVariables(),
+    excludeUpstream: true, // usually too hard to pick out upstream effects.
+    executorMap: mainExecutorMap, branch: branch)
+
+if (!streamingVersion) {
+    error "Could not determine TIBCO Streaming version under test."
+}
+
+echo "TIBCO Streaming " + streamingVersion + " under test."
+
+String deployRepository = jobUtil.getEPRepository(streamingVersion, platform)
+
+if (!buildingMilestone) {
+    buildingMilestone = artifactory.getStrMilestone(platform: platform, pipeline: upstreamPipeline, version: streamingVersion)
+}
+
+if (!projecturl) {
+    projecturl = jobUtil.getStrSiteURL(artifactory, pomVersion, buildingMilestone)
+}
+
+if (jobUtil.isMavenReleaseVersion(pomVersion)) {
+    mavenExtras += " -Drelease-candidate"
+}
+
+def thisPipelineAsBuild = jobUtil.thisJobAsBuild()
+echo "Building ${buildingMilestone} with Streaming ${streamingVersion}."
+echo "  Artifacts in ${deployRepository} built by this ${pipeline} pipeline have the build parent " + thisPipelineAsBuild
+// See SB-49976 to improve this.
+def streamingPipelinesPattern = thisPipelineAsBuild.replace(":: " + pipeline, ":: " + "*")
+echo "  If this ${pipeline} pipeline is approved, artifacts in the ${streamingPipelinesPattern} will be marked as final."
+
+alert.setDescription(currentBuild, buildingMilestone)
+
+if (buildingMilestone == "None") {
+    node (jobUtil.getJenkinsBuiltInNodeLabel()) {
+        emailext (
+            subject: "FAILED: ${env.JOB_NAME}",
+            to: notificationEmail,
+            replyTo: "platform.org@tibco.com",
+            body: "Critical error, previous pipeline not found in ${env.JOB_NAME}"
+        )
+        slackSend color: 'warning', message: "Critical error, previous pipeline not found in ${env.JOB_NAME}"
+    }
+    error "Milestone not found"
+}
+
+// Build all steps - this should be generic and based on variables and parameters above
+//
+for (step in steps) {
+    def thisStage = step[0]
+    def thisBranch = step[1][0]
+    def thisExtras = mavenExtras + step[1][1]
+    def thisLabel = step[1][2]
+    def thisSkip = step[1][3]
+
+    stage (thisStage) {
+        milestone :label thisStage + ".build"
+        if (thisSkip == "false") {
+            def toBuild = alert.newToBuild(label: thisLabel, mavenExtras: thisExtras) // prime the pump
+            while (toBuild.retry) {
+                def buildResult = jobUtil.buildLegacyJob(
+                    jobName: "EventProcessing/${thisStage}",
+                    branch: thisBranch,
+                    buildingMilestone: buildingMilestone,
+                    jdkVersion: qaJDKVersion,
+                    toBuild: toBuild,
+                    moreJobParameters: [
+                        // For github-samples.*
+                        string(name: 'project.version', value: streamingVersion)
+                    ])
+                if (alert.jobAlert(buildResult, currentBuild) ) {
+                    milestone :label thisStage + ".alerted"
+                    toBuild.retry = false
+                } else {
+                    // acceptFailures allows toBuild.retry to be false without addressing the failure
+                    def failureDisposition = alert.handleFailure(buildResult: buildResult, description: thisStage,
+                                                                 toBuild: toBuild, acceptFailure: true)
+                    toBuild = failureDisposition.toBuild
+                    alert.resumeAlert(buildResult, currentBuild, failureDisposition.inputResult);
+                }
+            }
+        }
+    }
+}
+
+stage ("markcomplete.${platform}") {
+    // Mark QA pipeline as completed
+    artifactory.setLatestMilestoneInRepository(
+        milestone: buildingMilestone,
+        pipeline: pipeline,
+        platform: platform,
+        repository: deployRepository,
+        parentName: jobUtil.thisJobAsBuild()
+    )
+
+    // Mark entire set of Streaming pipelines complete.
+    //
+    // TODO: Get version and platform parts of this pipeline to match other pipelines
+    //   See SB-49976.
+    //   (why this is not done by milestone?).
+
+    // Mark entire set of Streaming pipelines complete.
+    //
+    // TODO: Get version and platform parts of this pipeline to match other pipelines
+    //   See SB-49976.
+    //   (why this is not done by milestone?).
+    artifactory.setArtifactoryPropertiesByQuery(
+        searchPropertyName: "milestone.latest",
+        searchPropertyValue: platform,
+        // AQL wildcarding can't handle a pattern like (runtime|studio|ams), so we'll
+        // make sure that we only touch EventProcessing for now.
+        // Might be safer to list out parent patterns and iterate over them.
+        parentName: streamingPipelinesPattern,
+        setProperty: "milestone.latest=none",
+        repository: deployRepository
+    )
+
+    artifactory.setArtifactoryPropertiesByQuery(
+        searchPropertyName: 'milestone',
+        searchPropertyValue: buildingMilestone,
+        setProperty: "milestone.complete=true|milestone.latest=${platform}",
+        repository: deployRepository
+    )
+
+    // Special case for the installer.
+    artifactory.setStrInstallersComplete(
+        milestone: buildingMilestone,
+        platform: platform,
+        repository: 'ep-product-installers-bos',
+    )
+}
+
+alert.pipelineAlert("SUCCESS", currentBuild, buildingMilestone);
+
+
+
+and the gitbhub samples pipeline is
+// Copyright 2021-2023 Cloud Software Group, Inc.
+//
+//
+
+@Library('workflowLibs') _
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+String executorLabel = jobUtil.getStrBuildLabelEx(
+    platform: platform, params: params,
+    base: [ all: "c.unix-tools",
+           linux: "(o.rh8 || o.almalinux8) && c.docker-compatible-linux-3.10 && c.unix-tools && q.str",
+           macos: "o.macos",
+           windows: "o.windows && c.windows-10-compatible && a.x86_64" ],
+)
+
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '2' ))
+        quietPeriod(600)
+        timeout(time: 4, unit: 'HOURS')
+        skipDefaultCheckout() // to subdirectory, see below
+    }
+
+    triggers {
+        // Poll once a day.
+	pollSCM('H 0 * * *')
+    }
+
+    parameters {
+        choice(name: 'deployArtifacts', choices: ['never', 'default', 'always'], // never first; just for testing
+               description: 'The default is never to deploy because this is a test-only pipeline.')
+
+        string(name: 'mavenExtras', defaultValue: '',
+               description: 'Extra JVM options for Maven, usually -DskipTests and the like.')
+
+        booleanParam(name: 'cleanWorkspace', defaultValue: true, description: 'Clean workspace before build.')
+
+	// Change authors always get succcess emails.
+        // Team branches send failure emails to the team, too.
+        string(name: 'notificationEmail', defaultValue: 'when:team:hello@cloud.team, change-authors',
+               description: 'Email addresses for notifications on failure.')
+
+        // Just notify change authors on any branch, since this will never get released.
+        string(name: 'successEmail', defaultValue: 'change-authors',
+               description: 'Email addresses for notifications on success.')
+
+
+        choice(name: 'buildVerbose', choices: ['default', 'pipeline', 'tools' ],
+               description: 'Make build more verbose with pipeline and tool diagnostics.')
+
+
+	//string(name: 'streamingTargetVersion', defaultValue: '',
+   		 //description: 'Override the version of Streaming used by the samples.')
+
+	string(name: 'PROJECT_VERSION', defaultValue: '',
+		 description: 'The version of Streaming that the samples use.')
+
+    }
+    
+    agent {
+        node {
+            label "${executorLabel}"        }
+    }
+
+    environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+    }
+
+    stages {
+        stage ('janitor-before-job') {
+            steps {
+                script {
+                    epDeclarative.preCleanup()
+                }
+            }
+        }
+
+        stage ('checkout') {
+            steps {
+                // Check out to a subdirectory to avoid clashes with TIBCO_EP_HOME
+                // and other helper directories in the workspace.
+                dir ('src') {
+                    checkout scm
+                }
+            }
+        }
+
+        stage ('Build') {
+            steps {
+                script {
+		    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+		    def newPlatform = "linux"
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+			testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+		
+		    // Override the streaming target version if supplied
+                    // if (params.streamingTargetVersion) {
+                    //   env.STREAMING_VERSION = params.streamingTargetVersion
+                    //  }
+			
+			if (params.PROJECT_VERSION) {
+                      		  env.PROJECT_VERSION = params.PROJECT_VERSION
+                   	 }
+
+
+                    epDeclarative.buildMaven(
+                        goals: "install",
+                        platform: platform)
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                epDeclarative.postAlways()
+            }
+        }
+
+        cleanup {
+            script {
+                epDeclarative.postCleanup()
+            }
+        }
+    }
+}
+
+
+so that Trying to figure out how change the version of Streaming under test in tibco-streaming-samples works.
+
+The controlling QA pipeline figures to the real version of Streaming under test and then passes to the sample through project.version:
+ChatGPT
+To change the version of Streaming under test in the tibco-streaming-samples pipeline, you can do the following:
+
+Find the parameter PROJECT_VERSION in the tibco-streaming-samples pipeline. It should be declared in the parameters block at the beginning of the pipeline.
+
+In the controlling QA pipeline (the one you provided), there is a section where the github-samples.java17.* step is added to the steps list. Inside that step, you can pass the streamingVersion as a Maven parameter using the string function. The relevant part of the code looks like this:
+
+groovy
+Copy code
+steps.add(["github-samples.java17." + jobPlatform, [use_branch_githubsamples, mavenExtras_githubsamples, samplesBuildLabel, skip_githubsamples, string(name: 'project.version', value: streamingVersion)]])
+This will pass the streamingVersion as a Maven property to the tibco-streaming-samples pipeline when it's triggered from the QA pipeline. The project.version property is used in the tibco-streaming-samples pipeline to specify the version of Streaming to be used for the build.
+
+So, in summary, the controlling QA pipeline fetches the real version of Streaming under test, and then it passes that version to the tibco-streaming-samples pipeline as the project.version property, which controls the version of Streaming used in the samples pipeline.
+
+User
+so how the github samples pipeline fetches the real version of Streaming under test, and then it passes that version to the tibco-streaming-samples pipeline as the project.version property, which controls the version of Streaming used in the samples pipeline.
+and how do i include in the below pipeline 
+
+// Copyright 2021-2023 Cloud Software Group, Inc.
+//
+//
+
+@Library('workflowLibs') _
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+String executorLabel = jobUtil.getStrBuildLabelEx(
+    platform: platform, params: params,
+    base: [ all: "c.unix-tools",
+           linux: "(o.rh8 || o.almalinux8) && c.docker-compatible-linux-3.10 && c.unix-tools && q.str",
+           macos: "o.macos",
+           windows: "o.windows && c.windows-10-compatible && a.x86_64" ],
+)
+
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '2' ))
+        quietPeriod(600)
+        timeout(time: 4, unit: 'HOURS')
+        skipDefaultCheckout() // to subdirectory, see below
+    }
+
+    triggers {
+        // Poll once a day.
+	pollSCM('H 0 * * *')
+    }
+
+    parameters {
+        choice(name: 'deployArtifacts', choices: ['never', 'default', 'always'], // never first; just for testing
+               description: 'The default is never to deploy because this is a test-only pipeline.')
+
+        string(name: 'mavenExtras', defaultValue: '',
+               description: 'Extra JVM options for Maven, usually -DskipTests and the like.')
+
+        booleanParam(name: 'cleanWorkspace', defaultValue: true, description: 'Clean workspace before build.')
+
+	// Change authors always get succcess emails.
+        // Team branches send failure emails to the team, too.
+        string(name: 'notificationEmail', defaultValue: 'when:team:hello@cloud.team, change-authors',
+               description: 'Email addresses for notifications on failure.')
+
+        // Just notify change authors on any branch, since this will never get released.
+        string(name: 'successEmail', defaultValue: 'change-authors',
+               description: 'Email addresses for notifications on success.')
+
+
+        choice(name: 'buildVerbose', choices: ['default', 'pipeline', 'tools' ],
+               description: 'Make build more verbose with pipeline and tool diagnostics.')
+
+
+	//string(name: 'streamingTargetVersion', defaultValue: '',
+   		 //description: 'Override the version of Streaming used by the samples.')
+
+	string(name: 'PROJECT_VERSION', defaultValue: '',
+		 description: 'The version of Streaming that the samples use.')
+
+    }
+    
+    agent {
+        node {
+            label "${executorLabel}"        }
+    }
+
+    environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+    }
+
+    stages {
+        stage ('janitor-before-job') {
+            steps {
+                script {
+                    epDeclarative.preCleanup()
+                }
+            }
+        }
+
+        stage ('checkout') {
+            steps {
+                // Check out to a subdirectory to avoid clashes with TIBCO_EP_HOME
+                // and other helper directories in the workspace.
+                dir ('src') {
+                    checkout scm
+                }
+            }
+        }
+
+        stage ('Build') {
+            steps {
+                script {
+		    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+		    def newPlatform = "linux"
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+			testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+		
+		    // Override the streaming target version if supplied
+                    // if (params.streamingTargetVersion) {
+                    //   env.STREAMING_VERSION = params.streamingTargetVersion
+                    //  }
+			
+			if (params.PROJECT_VERSION) {
+                      		  env.PROJECT_VERSION = params.PROJECT_VERSION
+                   	 }
+
+
+                    epDeclarative.buildMaven(
+                        goals: "install",
+                        platform: platform)
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                epDeclarative.postAlways()
+            }
+        }
+
+        cleanup {
+            script {
+                epDeclarative.postCleanup()
+            }
+        }
+    }
+}
+
+2 / 2
+
+ChatGPT
+To include the functionality of fetching the real version of Streaming under test and passing it to the tibco-streaming-samples pipeline in the existing pipeline, you can follow these steps:
+
+Add a new step before the stage('checkout') stage to fetch the real version of Streaming under test. In the existing pipeline code, this is done using the SCM (Source Code Management) block with git commands. The pomVersion and streamingVersion variables are obtained from the pom.xml file.
+
+Pass the streamingVersion to the tibco-streaming-samples pipeline as the project.version parameter using the string function.
+
+Here's how you can modify the pipeline:
+
+groovy
+Copy code
+@Library('workflowLibs') _
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+String executorLabel = jobUtil.getStrBuildLabelEx(
+    platform: platform, params: params,
+    base: [ all: "c.unix-tools",
+           linux: "(o.rh8 || o.almalinux8) && c.docker-compatible-linux-3.10 && c.unix-tools && q.str",
+           macos: "o.macos",
+           windows: "o.windows && c.windows-10-compatible && a.x86_64" ],
+)
+
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '2' ))
+        quietPeriod(600)
+        timeout(time: 4, unit: 'HOURS')
+        skipDefaultCheckout() // to subdirectory, see below
+    }
+
+    triggers {
+        // Poll once a day.
+	pollSCM('H 0 * * *')
+    }
+
+    parameters {
+        // ... existing parameters ...
+
+        // Add a parameter to get the version of Streaming under test from the QA pipeline
+        string(name: 'streamingVersion', defaultValue: '',
+               description: 'The version of Streaming under test from the QA pipeline.')
+    }
+    
+    agent {
+        node {
+            label "${executorLabel}"        
+        }
+    }
+
+    environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+    }
+
+    stages {
+        // ... existing stages ...
+
+        stage ('checkout') {
+            steps {
+                // Check out to a subdirectory to avoid clashes with TIBCO_EP_HOME
+                // and other helper directories in the workspace.
+                dir ('src') {
+                    checkout scm
+                }
+            }
+        }
+
+        // Add a new stage to fetch the real version of Streaming under test
+        stage ('Fetch Streaming Version') {
+            steps {
+                script {
+                    // SCM for polling to fetch the version from the QA pipeline
+                    node (jobUtil.getJenkinsBuiltInNodeLabel()) {
+                        git branch: 'main', credentialsId: '<credentialsId_for_qa_pipeline>', url: '<URL_of_qa_pipeline_repository>'
+                        
+                        if (fileExists('pom.xml')) {
+                            pomVersion = pomUtil.getPomVersion('pom.xml')
+                            streamingVersion = pomUtil.getPomProperty('pom.xml', 'sb.version')
+                        }
+                    }
+                }
+            }
+        }
+
+        // ... existing stages ...
+
+        stage ('Build') {
+            steps {
+                script {
+		    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+		    def newPlatform = "linux"
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+			testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+		
+                    if (params.PROJECT_VERSION) {
+                        env.PROJECT_VERSION = params.PROJECT_VERSION
+                    }
+
+                    epDeclarative.buildMaven(
+                        goals: "install",
+                        platform: platform)
+                }
+            }
+        }
+    }
+
+    // ... existing post section ...
+
+}
+Now, when triggering the tibco-streaming-samples pipeline from the QA pipeline, make sure to pass the streamingVersion parameter along with other parameters like mavenExtras_githubsamples and samplesBuildLabel. This will ensure that the project.version parameter is set correctly in the tibco-streaming-samples pipeline based on the real version of Streaming under test.
+
+User
+how it could over ride the streaming version under build stage need compleate pipeline 
+// Copyright 2021-2023 Cloud Software Group, Inc.
+//
+//
+
+@Library('workflowLibs') _
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+//def pomVersion = ""
+
+//def streamingVersion = ""
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+String executorLabel = jobUtil.getStrBuildLabelEx(
+    platform: platform, params: params,
+    base: [ all: "c.unix-tools",
+           linux: "(o.rh8 || o.almalinux8) && c.docker-compatible-linux-3.10 && c.unix-tools && q.str",
+           macos: "o.macos",
+           windows: "o.windows && c.windows-10-compatible && a.x86_64" ],
+)
+
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '2' ))
+        quietPeriod(600)
+        timeout(time: 4, unit: 'HOURS')
+        skipDefaultCheckout() // to subdirectory, see below
+    }
+
+    triggers {
+        // Poll once a day.
+        pollSCM('H 0 * * *')
+    }
+
+    parameters {
+        choice(name: 'deployArtifacts', choices: ['never', 'default', 'always'], // never first; just for testing
+               description: 'The default is never to deploy because this is a test-only pipeline.')
+
+        string(name: 'mavenExtras', defaultValue: '',
+               description: 'Extra JVM options for Maven, usually -DskipTests and the like.')
+
+        booleanParam(name: 'cleanWorkspace', defaultValue: true, description: 'Clean workspace before build.')
+
+        // Change authors always get succcess emails.
+// Team branches send failure emails to the team, too.
+        string(name: 'notificationEmail', defaultValue: 'when:team:hello@cloud.team, change-authors',
+               description: 'Email addresses for notifications on failure.')
+
+        // Just notify change authors on any branch, since this will never get released.
+        string(name: 'successEmail', defaultValue: 'change-authors',
+               description: 'Email addresses for notifications on success.')
+
+
+        choice(name: 'buildVerbose', choices: ['default', 'pipeline', 'tools' ],
+               description: 'Make build more verbose with pipeline and tool diagnostics.')
+
+
+        string(name: 'PROJECT_VERSION', defaultValue: '',
+                 description: 'The version of Streaming that the samples use.')
+
+
+        string(name: 'streamingVersion', defaultValue: '',
+               description: 'The version of Streaming under samples from the github_samples pipeline.')
+
+    }
+
+    agent {
+        node {
+            label "${executorLabel}"        }
+    }
+
+    environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+    }
+
+    stages {
+        stage ('janitor-before-job') {
+            steps {
+                script {
+                    epDeclarative.preCleanup()
+                }
+            }
+        }
+stage ('checkout') {
+            steps {
+                // Check out to a subdirectory to avoid clashes with TIBCO_EP_HOME
+                // and other helper directories in the workspace.
+                dir ('src') {
+                    checkout scm
+                }
+            }
+        }
+
+        stage ('Fetch Streaming Version') {
+            steps {
+                script {
+                    // SCM for polling to fetch the version from the Github_samples pipeline
+                    node (jobUtil.getJenkinsBuiltInNodeLabel()) {
+
+                         git branch: use_branch_githubsamples, credentialsId: epscm.getCodelineCredentialsId('tibco-streaming-samples'), url: epscm.getCodelineUrl('tibco-streaming-samples')
+
+                        if (fileExists('pom.xml')) {
+                            pomVersion = pomUtil.getPomVersion('pom.xml')
+                            streamingVersion = pomUtil.getPomProperty('pom.xml', 'sb.version')
+                        }
+                    }
+                }
+            }
+        }
+
+        stage ('Build') {
+            steps {
+                script {
+                    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+                    def newPlatform = "linux"
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+                        testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+                        if (params.PROJECT_VERSION) {
+                                  env.PROJECT_VERSION = params.PROJECT_VERSION
+                         }
+
+
+                    epDeclarative.buildMaven(
+                        goals: "install",
+                        platform: platform)
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                epDeclarative.postAlways()
+            }
+        }
+
+        cleanup {
+            script {
+                epDeclarative.postCleanup()
+            }
+        }
+    }
+}
+
+2 / 2
+
+ChatGPT
+In the provided pipeline code, you already have a stage named Fetch Streaming Version that fetches the version of Streaming from the tibco-streaming-samples pipeline by checking out its code and reading the pom.xml file. This part is already in place and should fetch the correct streamingVersion.
+
+To override the streamingVersion in the Build stage of the pipeline, you need to modify the script block in that stage. Here's how you can do it:
+
+groovy
+Copy code
+stage ('Build') {
+    steps {
+        script {
+            def newJobUtil = new com.tibco.workflow.JobUtil()
+            def streamingPipeline = "runtime"
+            def newPlatform = "linux"
+
+            // Check if the 'streamingVersion' parameter is provided.
+            if (params.streamingVersion) {
+                // Use the provided 'streamingVersion' instead of the fetched one.
+                streamingVersion = params.streamingVersion
+            }
+
+            epDeclarative.buildInit(
+                pomFile: 'src/pom.xml',
+                javaTool: newJobUtil.getOracleJava17Tool(),
+                mavenTool: newJobUtil.getMaven38Tool(),
+                testPlatforms: [ "macos", "windows" ],
+                primaryPlatform: "linux"
+            )
+
+            if (params.PROJECT_VERSION) {
+                env.PROJECT_VERSION = params.PROJECT_VERSION
+            }
+
+            epDeclarative.buildMaven(
+                goals: "install",
+                platform: platform)
+        }
+    }
+}
+With this modification, the streamingVersion will be overridden with the value provided in the streamingVersion parameter if it's specified when triggering the pipeline. If the parameter is not provided, the pipeline will still fetch the version from the tibco-streaming-samples pipeline as before.
+
+Now, when you trigger the pipeline, you can pass the streamingVersion parameter to set the version of Streaming that should be used in the build. If the parameter is not provided, the pipeline will use the version fetched from the tibco-streaming-samples pipeline.
+
+User
+how do we specify in the env space PROJECT_VERSION=${project.version} in jenkins file
+ChatGPT
+To specify an environment variable in the Jenkinsfile, you can use the environment block and define the variable with the ${project.version} value. Here's how you can do it:
+
+groovy
+Copy code
+pipeline {
+    // ... (other pipeline configurations) ...
+    
+    environment {
+        PROJECT_VERSION = "${project.version}"
+    }
+
+    stages {
+        // ... (stages of the pipeline) ...
+    }
+
+    post {
+        // ... (post-build actions) ...
+    }
+}
+In this example, the environment block is used to define an environment variable named PROJECT_VERSION, and its value is set to the ${project.version} placeholder. The value of ${project.version} will be replaced with the actual value of the variable when the pipeline is executed.
+
+Please note that for this to work, the project.version value must be available in the context where the Jenkinsfile is being executed. The value could be obtained from various sources, such as through the parameters passed when triggering the pipeline or fetched from a version control system like Git.
+
+Make sure to adjust the pipeline configuration and variable assignment based on how the project.version is determined in your specific setup.
+
+User
+getting an error in the pipeline could you please check the script wether it is valid or not if any thig is wrong currect it
+// Copyright 2021-2023 Cloud Software Group, Inc.
+//
+//
+
+@Library('workflowLibs') _
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+String executorLabel = jobUtil.getStrBuildLabelEx(
+    platform: platform, params: params,
+    base: [ all: "c.unix-tools",
+           linux: "(o.rh8 || o.almalinux8) && c.docker-compatible-linux-3.10 && c.unix-tools && q.str",
+           macos: "o.macos",
+           windows: "o.windows && c.windows-10-compatible && a.x86_64" ],
+)
+
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '2' ))
+        quietPeriod(600)
+        timeout(time: 4, unit: 'HOURS')
+        skipDefaultCheckout() // to subdirectory, see below
+    }
+
+    triggers {
+        // Poll once a day.
+	pollSCM('H 0 * * *')
+    }
+
+    parameters {
+        choice(name: 'deployArtifacts', choices: ['never', 'default', 'always'], // never first; just for testing
+               description: 'The default is never to deploy because this is a test-only pipeline.')
+
+        string(name: 'mavenExtras', defaultValue: '',
+               description: 'Extra JVM options for Maven, usually -DskipTests and the like.')
+
+        booleanParam(name: 'cleanWorkspace', defaultValue: true, description: 'Clean workspace before build.')
+
+	// Change authors always get succcess emails.
+        // Team branches send failure emails to the team, too.
+        string(name: 'notificationEmail', defaultValue: 'when:team:streaming-sample-test-watchers@cloud-team, change-authors',
+               description: 'Email addresses for notifications on failure.')
+
+        // Just notify change authors on any branch, since this will never get released.
+        string(name: 'successEmail', defaultValue: 'change-authors',
+               description: 'Email addresses for notifications on success.')
+
+
+        choice(name: 'buildVerbose', choices: ['default', 'pipeline', 'tools' ],
+               description: 'Make build more verbose with pipeline and tool diagnostics.')
+
+
+	string(name: 'PROJECT_VERSION', defaultValue: '',
+		 description: 'The version of Streaming that the samples use.')
+
+ 	string(name: 'streamingVersion', defaultValue: '',
+               description: 'The version of Streaming under samples from the github_samples pipeline.')	
+
+    }
+    
+    agent {
+        node {
+            label "${executorLabel}"        }
+    }
+
+    environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+    }
+
+    stages {
+        stage ('janitor-before-job') {
+            steps {
+                script {
+                    epDeclarative.preCleanup()
+                }
+            }
+        }
+
+        stage ('checkout') {
+            steps {
+                // Check out to a subdirectory to avoid clashes with TIBCO_EP_HOME
+                // and other helper directories in the workspace.
+                dir ('src') {
+                    checkout scm
+                }
+            }
+        }
+
+	stage ('Fetch Streaming Version') {
+            steps {
+                script {
+                    // SCM for polling to fetch the version from the Github_samples pipeline
+                    node (jobUtil.getJenkinsBuiltInNodeLabel()) {
+
+                         git branch: use_branch_githubsamples, credentialsId: epscm.getCodelineCredentialsId('tibco-streaming-samples'), url: epscm.getCodelineUrl('tibco-streaming-samples')
+
+                        if (fileExists('pom.xml')) {
+                            pomVersion = pomUtil.getPomVersion('pom.xml')
+                            streamingVersion = pomUtil.getPomProperty('pom.xml', '${project.version}')
+                        }
+                    }
+                }
+            }
+        }
+
+	stage ('Build') {
+            steps {
+                script {
+                         def newJobUtil = new com.tibco.workflow.JobUtil()
+                         def streamingPipeline = "runtime"
+                         def newPlatform = "linux"
+
+                         // Check if the 'streamingVersion' parameter is provided.
+                         if (params.streamingVersion) {
+                         // Use the provided 'streamingVersion' instead of the fetched one.
+                         streamingVersion = params.streamingVersion
+                       }
+
+                         epDeclarative.buildInit(
+                         pomFile: 'src/pom.xml',
+                         javaTool: newJobUtil.getOracleJava17Tool(),
+                         mavenTool: newJobUtil.getMaven38Tool(),
+                         testPlatforms: [ "macos", "windows" ],
+                         primaryPlatform: "linux"
+                         )
+
+                         if (params.PROJECT_VERSION) {
+                                 env.PROJECT_VERSION = params.${project.version}
+                         }
+
+                         epDeclarative.buildMaven(
+                         goals: "install",
+                         platform: platform)
+                  }
+            }
+        }
+
+    }
+	
+    post {
+        always {
+            script {
+                epDeclarative.postAlways()
+            }
+        }
+
+        cleanup {
+            script {
+                epDeclarative.postCleanup()
+            }
+        }
+    }
+}
+ChatGPT
+The provided Jenkinsfile seems to have a few issues. Let's go through them and correct them:
+
+The line streamingVersion = pomUtil.getPomProperty('pom.xml', '${project.version}') in the Fetch Streaming Version stage should use double quotes for string interpolation instead of single quotes. Update it to:
+groovy
+Copy code
+streamingVersion = pomUtil.getPomProperty('pom.xml', "${project.version}")
+The line env.PROJECT_VERSION = params.${project.version} in the Build stage has a syntax error. To access the value of the PROJECT_VERSION parameter, you should use square brackets, not dot notation. Update it to:
+groovy
+Copy code
+env.PROJECT_VERSION = params.PROJECT_VERSION
+There's an extra comma at the end of the newPlatform assignment in the Build stage. Remove it:
+groovy
+Copy code
+def newPlatform = "linux"
+After making these corrections, the Jenkinsfile should look like this:
+
+groovy
+Copy code
+// ... (Library and environment setup)
+
+pipeline {
+    // ... (pipeline options and triggers)
+
+    parameters {
+        // ... (parameter definitions)
+    }
+    
+    agent {
+        // ... (agent definition)
+    }
+
+    environment {
+        // ... (environment variable definitions)
+    }
+
+    stages {
+        // ... (janitor-before-job and checkout stages)
+
+        stage ('Fetch Streaming Version') {
+            steps {
+                script {
+                    // ... (Fetching the version of Streaming)
+                }
+            }
+        }
+
+        stage ('Build') {
+            steps {
+                script {
+                    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+                    def newPlatform = "linux"
+
+                    // Check if the 'streamingVersion' parameter is provided.
+                    if (params.streamingVersion) {
+                        // Use the provided 'streamingVersion' instead of the fetched one.
+                        streamingVersion = params.streamingVersion
+                    }
+
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+                        testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+
+                    if (params.PROJECT_VERSION) {
+                        env.PROJECT_VERSION = params.PROJECT_VERSION
+                    }
+
+                    epDeclarative.buildMaven(
+                        goals: "install",
+                        platform: platform
+                    )
+                }
+            }
+        }
+    }
+	
+    post {
+        // ... (post-build actions)
+    }
+}
+With these corrections, the Jenkinsfile should be valid and should work as intended. Make sure to trigger the pipeline with the appropriate parameters to set the streamingVersion and PROJECT_VERSION values as needed.
+
+User
+PROJECT_VERSION=${project.version}
+
+But I don't see where PROJECT_VERSION is used otherwise in the job. project.version is also an environment variable but how would that affect things?
+ChatGPT
+In the provided Jenkinsfile, PROJECT_VERSION=${project.version} is not used directly within the job. It is a parameter defined in the Jenkins pipeline, allowing users to provide a specific value for the PROJECT_VERSION parameter when triggering the pipeline.
+
+Here's how it works:
+
+The parameter PROJECT_VERSION is defined in the parameters block of the pipeline:
+groovy
+Copy code
+parameters {
+    string(name: 'PROJECT_VERSION', defaultValue: '', description: 'The version of Streaming that the samples use.')
+}
+When the pipeline is triggered, it can be triggered with a specific value for the PROJECT_VERSION parameter. For example, if someone triggers the pipeline with the following parameters:
+PROJECT_VERSION: 1.0.0
+Then within the Jenkins pipeline, the PROJECT_VERSION variable will be set to the value 1.0.0. This value can then be used within the pipeline steps, scripts, or conditions to control various aspects of the pipeline execution.
+
+For example, in the provided Jenkinsfile, within the Build stage, you can see this code:
+
+groovy
+Copy code
+if (params.PROJECT_VERSION) {
+    env.PROJECT_VERSION = params.PROJECT_VERSION
+}
+This code checks if the PROJECT_VERSION parameter has been provided when triggering the pipeline, and if so, it sets the env.PROJECT_VERSION environment variable to the value of the PROJECT_VERSION parameter. This allows the provided value to be accessible within the Jenkins pipeline for further use, such as in the build steps or post-actions.
+
+So, PROJECT_VERSION=${project.version} is just a way to allow the Jenkins pipeline to receive input from users (or other automated systems) and use that input within the pipeline execution. The value of project.version is not a predefined environment variable in Jenkins itself; instead, it's a placeholder that represents the value provided for the PROJECT_VERSION parameter when the pipeline is triggered.
+
+User
+in a detaild way i need
+ChatGPT
+Certainly! Let's break down how the PROJECT_VERSION=${project.version} works in the Jenkins pipeline in a detailed step-by-step manner:
+
+Parameter Declaration:
+In the Jenkins pipeline, you can define parameters that allow users to input values when triggering the pipeline. In the provided Jenkinsfile, the parameter PROJECT_VERSION is defined in the parameters block as follows:
+groovy
+Copy code
+parameters {
+    string(name: 'PROJECT_VERSION', defaultValue: '', description: 'The version of Streaming that the samples use.')
+}
+This declares a string parameter named PROJECT_VERSION with a default value of an empty string. It also provides a description for the parameter.
+
+Triggering the Pipeline:
+When the Jenkins pipeline is triggered, either manually by a user or through some automation process, the user (or the automation) can provide values for the defined parameters. For example, when triggering the pipeline, the user might provide a specific value for the PROJECT_VERSION parameter. Let's assume the user triggers the pipeline with the following parameters:
+
+PROJECT_VERSION: 2.1.0
+Accessing the Provided Value:
+Within the Jenkins pipeline, the provided parameter values are accessible using the params object. The params object contains the values of all the parameters defined in the pipeline.
+
+In the provided Jenkinsfile, there is a section within the Build stage that checks if the PROJECT_VERSION parameter has been provided by the user when triggering the pipeline:
+
+groovy
+Copy code
+if (params.PROJECT_VERSION) {
+    env.PROJECT_VERSION = params.PROJECT_VERSION
+}
+Setting Environment Variable:
+If the PROJECT_VERSION parameter has been provided (i.e., it is not empty), the value of params.PROJECT_VERSION is assigned to the environment variable env.PROJECT_VERSION. This allows the provided value to be accessible as an environment variable within the Jenkins pipeline.
+
+In our example case, since the user provided the value 2.1.0 for the PROJECT_VERSION parameter, the environment variable PROJECT_VERSION will be set to 2.1.0.
+
+Using the Environment Variable:
+The environment variable PROJECT_VERSION can now be used within the Jenkins pipeline. It can be accessed using the env object. For example, it can be used in the Maven build step or in any other script within the pipeline:
+
+groovy
+Copy code
+epDeclarative.buildMaven(
+    goals: "install",
+    platform: platform,
+    mavenExtras: "-Dproject.version=${env.PROJECT_VERSION}"
+)
+In this example, the value of env.PROJECT_VERSION is used to set the Maven property project.version, which controls the version of the Maven project during the build.
+
+In summary, PROJECT_VERSION=${project.version} in the Jenkinsfile allows users to provide a value for the PROJECT_VERSION parameter when triggering the pipeline. The provided value is then set as an environment variable, which can be used in subsequent steps or scripts within the Jenkins pipeline.
+
+User
+is this valid in jenkins file
+ChatGPT
+Apologies for the confusion in my previous response. I made a mistake in the explanation. The expression ${project.version} is used to access the project.version property from the Maven POM file, but it cannot be directly used in a Jenkins declarative pipeline.
+
+In a Jenkins declarative pipeline, you cannot directly access properties from the Maven POM file using ${} syntax as you would in a Maven build. Instead, you need to use a library or plugin to extract values from the POM file and make them available as environment variables or pipeline variables.
+
+To achieve this, you can use the readMavenPom step from the Pipeline Utility Steps plugin. This step allows you to read and extract information from the Maven POM file and use it in your Jenkins pipeline.
+
+Here's how you can modify the Jenkinsfile to use the readMavenPom step:
+
+Install the Pipeline Utility Steps plugin in Jenkins if it's not already installed.
+
+Modify the Jenkinsfile as follows:
+
+groovy
+Copy code
+@Library('workflowLibs') _
+import org.jenkinsci.plugins.pipeline.utility.steps.maven.MavenPom
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+// ... Rest of the code ...
+
+pipeline {
+    // ... Rest of the pipeline ...
+
+    stages {
+        // ... Rest of the stages ...
+
+        stage ('Fetch Streaming Version') {
+            steps {
+                script {
+                    // Read the Maven POM file
+                    def pom = readMavenPom file: 'src/pom.xml'
+
+                    // Access the project.version property from the POM file
+                    streamingVersion = pom.version
+
+                    // Now streamingVersion contains the version from the POM file
+                    echo "Streaming Version: ${streamingVersion}"
+                }
+            }
+        }
+
+        // ... Rest of the stages ...
+
+        stage ('Build') {
+            steps {
+                script {
+                    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+                    def newPlatform = "linux"
+
+                    // Override the streamingVersion if provided as a parameter
+                    if (params.streamingVersion) {
+                        streamingVersion = params.streamingVersion
+                    }
+
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+                        testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+
+                    if (params.PROJECT_VERSION) {
+                        env.PROJECT_VERSION = params.PROJECT_VERSION
+                    }
+
+                    epDeclarative.buildMaven(
+                        goals: "install",
+                        platform: platform
+                    )
+                }
+            }
+        }
+    }
+
+    // ... Rest of the post section ...
+}
+By using the readMavenPom step, the streamingVersion variable will be populated with the value of the project.version property from the Maven POM file. If the streamingVersion parameter is provided when triggering the pipeline, it will override the value read from the POM file.
+
+User
+ environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+        PROJECT_VERSION=${project.version}
+    }
+ChatGPT
+In a Jenkins declarative pipeline, the environment block is used to define environment variables that will be available to all steps in the pipeline. However, the way you have specified the PROJECT_VERSION variable using ${project.version} is not correct. In a Jenkins pipeline, you cannot directly access properties from the Maven POM file using ${} syntax as you would in a Maven build.
+
+To set the PROJECT_VERSION environment variable with the value of the project.version property from the Maven POM file, you should use the readMavenPom step from the Pipeline Utility Steps plugin, just like I showed in the previous response. Here's the correct way to set the PROJECT_VERSION environment variable:
+
+groovy
+Copy code
+@Library('workflowLibs') _
+import org.jenkinsci.plugins.pipeline.utility.steps.maven.MavenPom
+
+def jobUtil = new com.tibco.workflow.JobUtil()
+
+String platform = jobUtil.getJobPlatform(defaultPlatform: "linux")
+
+pipeline {
+    // ... Rest of the pipeline ...
+
+    environment {
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/"
+
+        // Read the Maven POM file
+        def pom = readMavenPom file: 'src/pom.xml'
+
+        // Set the PROJECT_VERSION environment variable with the value of project.version from the POM file
+        PROJECT_VERSION = pom.version
+    }
+
+    stages {
+        // ... Rest of the stages ...
+
+        stage ('Build') {
+            steps {
+                script {
+                    def newJobUtil = new com.tibco.workflow.JobUtil()
+                    def streamingPipeline = "runtime"
+                    def newPlatform = "linux"
+
+                    // Override the streamingVersion if provided as a parameter
+                    if (params.streamingVersion) {
+                        streamingVersion = params.streamingVersion
+                    }
+
+                    epDeclarative.buildInit(
+                        pomFile: 'src/pom.xml',
+                        javaTool: newJobUtil.getOracleJava17Tool(),
+                        mavenTool: newJobUtil.getMaven38Tool(),
+                        testPlatforms: [ "macos", "windows" ],
+                        primaryPlatform: "linux"
+                    )
+
+                    // The PROJECT_VERSION environment variable will be available here with the value from the POM file
+                    echo "Project Version: ${PROJECT_VERSION}"
+
+                    // ... Rest of the build steps ...
+                }
+            }
+        }
+    }
+
+    // ... Rest of the pipeline ...
+}
+With this code, the PROJECT_VERSION environment variable will be set to the value of the project.version property from the Maven POM file, and you can access it as ${PROJECT_VERSION} in your pipeline steps.
+
+User
+cron job for every 5 mins
+ChatGPT
+To create a cron job in Jenkins that runs every 5 minutes, you can use the following cron syntax:
+
+markdown
+Copy code
+*/5 * * * *
+This cron expression can be added to a Jenkins declarative pipeline or a Jenkins freestyle job.
+
+For a declarative pipeline, you can use the triggers block to define the cron schedule. Here's an example:
+
+groovy
+Copy code
+pipeline {
+    triggers {
+        cron('*/5 * * * *')
+    }
+    // Rest of the pipeline configuration and stages
+}
+For a freestyle job, you can go to the Jenkins job configuration, scroll down to the "Build Triggers" section, and select the "Build periodically" option. Then, enter the cron expression */5 * * * * in the "Schedule" field.
+
+With either approach, the job will run every 5 minutes.
+
+User
+how do we featch the project version in the jenkins file 
+ChatGPT
+In a Jenkins pipeline, you can fetch the project version from the pom.xml file using the readMavenPom step provided by the Jenkins Pipeline Maven Integration plugin. This step reads the Maven Project Object Model (POM) and allows you to access various properties defined in the pom.xml, including the project version.
+
+Here's how you can use the readMavenPom step to fetch the project version in your Jenkins pipeline:
+
+groovy
+Copy code
+pipeline {
+    agent any
+    
+    stages {
+        stage('Fetch Project Version') {
+            steps {
+                script {
+                    def pom = readMavenPom file: 'pom.xml'
+                    def projectVersion = pom.version
+                    echo "Project Version: ${projectVersion}"
+                    
+                    // Now you can use the 'projectVersion' variable as needed in your pipeline
+                    // For example, you can set an environment variable:
+                    env.PROJECT_VERSION = projectVersion
+                }
+            }
+        }
+        
+        // Add more stages as needed for your pipeline
+    }
+}
+In this example, the readMavenPom step reads the pom.xml file located in the root of your project, and then we access the project version using pom.version. The fetched project version is stored in the projectVersion variable, and you can use it as needed in subsequent stages or steps.
+
+If you haven't already installed the Jenkins Pipeline Maven Integration plugin, you can do so by going to "Manage Jenkins" > "Manage Plugins" > "Available" tab, and search for "Pipeline Maven Integration" to install it.
+
+User
+from where it would take pom.version
+ChatGPT
+The pom.version is a property defined in the Maven Project Object Model (POM) file (pom.xml) of your project. The pom.xml is an XML file used by Apache Maven to manage project information, dependencies, and build configuration.
+
+When you run the readMavenPom step in a Jenkins pipeline, it parses the pom.xml file and creates a data structure representing the Maven POM. This data structure includes various properties defined in the pom.xml, such as groupId, artifactId, version, etc.
+
+The pom.version is the version of your Maven project, which is typically specified in the <version> element in the pom.xml file. For example:
+
+xml
+Copy code
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>my-app</artifactId>
+    <version>1.0.0</version> <!-- This is the version of the project -->
+    <!-- Other elements and configurations -->
+</project>
+When the readMavenPom step is executed, it reads the pom.xml file and retrieves the value specified in the <version> element and assigns it to the pom.version property in the Jenkins pipeline. You can then use this value in your pipeline for various purposes, such as setting environment variables, generating artifacts, or tagging releases, among other things.
+
+
+
+
+

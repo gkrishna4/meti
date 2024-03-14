@@ -1,0 +1,240 @@
+
+
+User
+//
+// Copyright (c) 2021 Cloud Software Group, Inc.
+//
+// Declarative pipeline for TIBCO Cloud Data Streams.
+//
+
+@Library('workflowLibs') _
+
+// Guards against accidental starts.
+def buildStart = epDeclarative.guardStart([:])
+if (!buildStart) {
+    return
+}
+
+pipeline {
+    options {
+        // Only keep a few builds, for up to week.
+        buildDiscarder(logRotator(daysToKeepStr: '7',
+                                  numToKeepStr: '3' ))
+        timeout(time: 3, unit: 'HOURS') // tests can make this much longer
+        skipDefaultCheckout() // to subdirectory, see below
+    }
+
+    triggers {
+        // When sources change; see SB-50183.
+        pollSCM('H 7,14,20 * * 1-5')
+    }
+
+    parameters {
+        choice(name: 'deployArtifacts', choices: ['default', 'never', 'always'],
+               description: 'By default, only main and release-work branches are deployed. Some deployments can be skipped if there are no changes in the default case.')
+
+        string(name: 'mavenExtras', defaultValue: '',
+               description: 'Extra JVM options for Maven, usually -DskipTests and the like.')
+
+        booleanParam(name: 'cleanWorkspace', defaultValue: true, description: 'Clean workspace before build.')
+
+        string(name: 'notificationEmail', defaultValue: 'when:team:tcds-dev@tibco.com change-authors',
+               description: 'Email addresses for notifications on failure.')
+
+        string(name: 'successEmail', defaultValue: 'when:release:tcds-dev@tibco.com when:release:sbase-release@tibco.com change-authors',
+               description: 'Email addresses for notifications on success.')
+
+        choice(name: 'buildVerbose', choices: ['default', 'pipeline', 'tools' ],
+               description: 'Make build more verbose with pipeline and tool diagnostics.')
+
+        string(name: 'buildLabel', defaultValue: '',
+               description: 'Jenkins build label override.')
+    }
+    
+    agent {
+        node {
+            // Any Streaming 11.x and node compatible linux.
+            label "((o.almalinux8 || o.rh8)) && c.docker-compatible-linux-3.10 && c.aws-cli-2 && c.docker-multi-stage-build && c.docker-20-compatible && q.str"
+        }
+    }
+
+    environment { // Not persisted in Artifactory build record.
+        // Needed for Maven CommonSettings.
+        TIBCO_EP_HOME = "${env.WORKSPACE}/EP"
+    }
+
+    stages {
+        stage ('janitor-before-job') {
+            steps {
+                script {
+                    epDeclarative.preCleanup()
+                }
+            }
+        }
+
+        stage ('checkout') {
+            steps {
+                // Deal with https://issues.jenkins.io/browse/JENKINS-52735
+                // Check out to a subdirectory to avoid clashes with TIBCO_EP_HOME
+                // and other helper directories in the workspace.
+                dir ('src') {
+                    checkout scm
+                }
+            }
+        }
+
+        stage ('Build') {
+            steps {
+                script {
+                    def jobUtil = new com.tibco.workflow.JobUtil()
+
+                    def streamingPipeline = "studio"
+                    def platform = "linux" // the one platform for which we build.
+
+                    // Used for both Helm and Docker deployments. nightly user and
+                    // password.
+                    String nightlyCredentialsId = '6127c133-dd4d-4cd7-995f-1e14775c2201'
+
+                    Map commonMavenOptions = [ additionalArgs: "-Prelease", mavenExtras: "" ]
+
+                    withEnv([ 'DOCKER_PUSH_REGISTRY=reldocker.tibco.com' ]) {
+                        withCredentials([usernamePassword( // same nightly credentials for Docker and Helm
+                            // Our deploy scripts use these environment varibles.
+                            // But Docker Maven plugin properties are passed in
+                            // from the outside.
+                            credentialsId: nightlyCredentialsId,
+                            usernameVariable: 'DOCKER_USERNAME', // used in sh scripts
+                            passwordVariable: 'DOCKER_PASSWORD'),
+                                         usernamePassword(
+                                credentialsId: nightlyCredentialsId,
+                                usernameVariable: 'HELM_REPO_USERNAME',
+                                passwordVariable: 'HELM_REPO_PASSWORD')
+                        ]) {
+
+                            epDeclarative.buildInit(
+                                pomFile: 'src/pom.xml',
+                                // Not typically using Streaming snapshot builds, but just in case.
+                                // Commented out to allow pulling dependencies from snapshots - Anand [TCDS-1228]
+                                // upstreamPipeline: "EventProcessing/" + streamingPipeline,
+                                upstreamMilestoneStem: streamingPipeline,
+                                upstreamVersion: 'pom-property:sbrt.version',
+                                prependingPath: [ tool("helm3.10.3") ],
+                                // Always skip Artifactory so repo options don't matter; this allows non-Artifactory side branch
+                                // deployment like Docker with an adjusted prefix.
+                                skipArtifactoryDeploy: true,
+                                containsUpstream: true, // yes, we pack a lot of Streaming in here
+                                // Had a hard time convincing the Docker Maven plugin to pay
+                                // attention to the authentication properties in a Maven profile,
+                                // so they are explicitly specified from the outside.
+                                mavenExtras: "-Ddocker.push.registry=${DOCKER_PUSH_REGISTRY} -Ddocker.push.username=${DOCKER_USERNAME} -Ddocker.push.password=${DOCKER_PASSWORD}",
+                                mavenSnapshotRepo: 'ep-snapshots',
+                                mavenSnapshotOptions: commonMavenOptions,
+                                mavenReleaseOptions: commonMavenOptions,
+                                mavenBranchOptions: [
+                                    // Maven-deploy features and issues branches with the name
+                                    // tacked onto the docker.prefix.
+                                    [ matching: [ "features(/.+)", "issues(/.+)" ], // matching group $1 includes the /
+                                     deployWithMavenRun: true,
+                                     properties: [ "streaming.docker.prefix.extra": '$lc:1' ] ]
+                                ],
+                                mavenReleaseRepo: 'ep-rc',
+                                // siteProduct: "cloud-ds", -- pending site build fixes for TCDS-1155 
+                                // mavenReleaseOptions: Apparently no additional options
+                                javaTool: jobUtil.getOracleJava17Tool(),
+                                mavenTool: jobUtil.getMaven38Tool(),
+                                primaryPlatform: "linux")
+
+                            epDeclarative.buildMaven(
+                                goals: "install", // with profiles supplied above
+                                platform: platform,
+                                otherDeployRun: [ goals: "docker:push" ])
+                            // These standalone scripts want to be run from the base of
+                            // Maven repo checkout.
+                            dir ('src') {
+                                // Also push all our external images to reldocker.tibco.com 
+                                epDeclarative.deployWithSh( 
+                                    script: "./push_ext_images_reldocker.sh")
+                                // Only one branch should be pushing charts and promoting as latest.
+                                // For now, that's main/1.1, but a better solution will address
+                                // TCDS-1197.
+                                // deployWithSh only runs its script on main and release work branches.
+                                boolean shouldDeployAsCIC = false
+                                if (shouldDeployAsCIC) {
+                                    // Might want to move these to a Maven project and use maven:exec
+                                    epDeclarative.deployWithSh( // pushes to the same place on reldocker
+                                        script: "./curl_push_reldocker.sh")
+                                    epDeclarative.deployWithSh(
+                                        script: "./promote_artifacts.sh --env cic --promote latest")
+                                    if (false) {
+                                        epDeclarative.deployReleaseWithSh(
+                                            // In 1.0.1: streaming-deployment/cic-aws-ecr/upload-images.sh Spotfire
+                                            script: "./promote_artifacts.sh --env spotfire --promote latest")
+                                    }
+                                }
+                                // In 1.0.1: ./streaming-deployment/cic-aws-ecr/upload-images.sh CIC-II
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                epDeclarative.postAlways()
+            }
+        }
+
+        cleanup {
+            script {
+                epDeclarative.postCleanup()
+            }
+        }
+    }
+}
+
+i need to push the archived build to http://ep-artifacts-us-east.tibco.com:8082/ as well and that to only the build is present at this location com/tibco/ep/cloud/streaming-addon-dist/1.3.0-SNAPSHOT/ 
+need the jenkins script following along above jenkins file
+ChatGPT
+To push the archived build to http://ep-artifacts-us-east.tibco.com:8082/ only if the build is present at the specified location com/tibco/ep/cloud/streaming-addon-dist/1.3.0-SNAPSHOT/, you can modify the Jenkins pipeline script as follows:
+
+Import the necessary libraries at the beginning of the script.
+Add a new stage to push the artifacts to the specified location.
+Add conditions to check whether the build is present and to determine whether the push is needed.
+Here's the modified pipeline script:
+
+groovy
+Copy code
+// ... (Existing code)
+
+stages {
+    // ... (Existing stages)
+    
+    stage ('Push Artifacts') {
+        steps {
+            script {
+                // Check if the build artifacts are present
+                def artifactsPath = "com/tibco/ep/cloud/streaming-addon-dist/1.3.0-SNAPSHOT/"
+                def artifactsExist = fileExists("${env.WORKSPACE}/src/target/${artifactsPath}")
+                
+                if (artifactsExist) {
+                    // Push the artifacts to the specified location
+                    def epArtifactsRepoUrl = "http://ep-artifacts-us-east.tibco.com:8082/"
+                    def targetUrl = "${epArtifactsRepoUrl}${artifactsPath}"
+                    sh "curl -u your_username:your_password --upload-file ${env.WORKSPACE}/src/target/${artifactsPath}* ${targetUrl}"
+                } else {
+                    echo "Build artifacts not found at ${artifactsPath}. Skipping artifact push."
+                }
+            }
+        }
+    }
+}
+
+// ... (Existing post section)
+Replace your_username and your_password with the appropriate credentials for the target repository.
+
+This new stage named 'Push Artifacts' will check if the build artifacts are present in the specified location and if so, it will use curl to upload them to the given repository URL. If the artifacts are not found, it will print a message indicating that the push is skipped.
+
+Make sure to place this new stage within the stages block in your existing Jenkins pipeline script, and adjust the paths and URLs as needed for your specific setup.
