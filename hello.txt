@@ -1,0 +1,873 @@
+name: Approval
+
+# Controls when the workflow will run
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      restore_anonymize:
+        required: false
+        type: boolean
+
+env:
+  ICON_TARGET_ENV: "${{ inputs.target }}"
+jobs:
+  Ops-Lead:
+    if: >-
+      contains(fromJson('["prod-deploy","int-deploy","dev3-restore","int-restore","prod-restore"]'), inputs.target)
+      || (inputs.restore_anonymize == false && contains(inputs.target,'restore'))
+    runs-on: self-hosted
+    environment: OPS-lead
+    steps:
+    - name: print approval environment
+      run: echo "Requesting Ops-Lead approval for ${ICON_TARGET_ENV}"
+  FCD:
+    if: contains(fromJson('["prod-deploy"]'), inputs.target)
+    runs-on: self-hosted
+    environment: FCD
+    steps:
+    - name: print approval environment
+      run: echo "Requesting FCD approval for ${ICON_TARGET_ENV}"
+  PL:
+    if: contains(fromJson('["prod-deploy"]'), inputs.target)
+    runs-on: self-hosted
+    environment: PL
+    steps:
+    - name: print approval environment
+      run: echo "Requesting PL approval for ${ICON_TARGET_ENV}"
+====================================================================================
+name: Backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        type: choice
+        description: Please choose the account (environment) to create a backup for.
+        required: true
+        options:
+        - dev1
+        - dev2
+        - dev3
+        - int
+        - prod
+      tenants:
+        description: Please provide the tenant ids (lowercase short form as JSON array) to create a backup for. (Example:'["pt"]').
+        required: true
+        default: '["pt"]'
+      ticketnumber:
+        description: Please enter the ticket number related to this backup
+        type: string
+        required: true
+
+jobs:
+  setEnvVars:
+    runs-on: self-hosted
+    outputs:
+      AccountID: ${{ steps.set-env-id.outputs.AccountID }}
+    environment: ${{ inputs.Environment }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: set environment id
+        id: set-env-id
+        env:
+          ICON_ENVIRONMENT: "${{ inputs.account }}"
+        run: |
+          account_id=$(jq -cr --arg ICON_ENV "${ICON_ENVIRONMENT}" '.[$ICON_ENV].account_id' ./.github/workflows/account_id_config.json)
+          stage=$(jq -cr --arg ICON_ENV "${ICON_ENVIRONMENT}" '.[$ICON_ENV].stage' ./.github/workflows/account_id_config.json)
+          echo "::set-output name=AccountID::"$account_id""
+
+  backup:
+    strategy:
+      matrix:
+        tenant: ${{ fromJSON(github.event.inputs.tenants) }}
+      fail-fast: false
+    concurrency: "${{ inputs.Environment }}-${{ matrix.tenant }}"
+    needs: setEnvVars
+    runs-on:
+      - self-hosted
+      - ${{ needs.setEnvVars.outputs.AccountID }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - name: checkout
+      uses: actions/checkout@v2
+    - name: configure aws credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: "arn:aws:iam::${{ needs.setEnvVars.outputs.AccountID }}:role/icon-gha-workflow-role"
+        role-session-name: "backup-${{ inputs.Environment }}"
+        role-duration-seconds: 7200
+        aws-region: "eu-central-1"
+    - name: create backup
+      env:
+        ICON_TICKETNUMBER: "${{ inputs.ticketnumber }}"
+      run: |
+        echo "Tenant: ${{ matrix.tenant }}"
+        echo "Ticketnumber: ${ICON_TICKETNUMBER}"
+
+        readonly job_name="backup-${{ matrix.tenant }}-$(openssl rand -hex 12)"
+        readonly backup_job_id="$(aws batch submit-job --job-name "$job_name" --job-queue "db-job-queue" \
+        --job-definition "db-backup-${{ matrix.tenant }}" \
+        --container-overrides "{\"environment\": [{\"name\":\"ICON_BACKUP_TYPE\",\"value\":\"long-term/${ICON_TICKETNUMBER}\"}]}" | jq -r '.jobId')"
+
+        echo "Job name: ${job_name}"
+        echo "Job ID: ${backup_job_id}"
+
+        jobs_status=''
+
+        echo "Waiting for job: ${job_name}"
+
+        while [[ ! "${jobs_status}" =~ (SUCCEEDED|FAILED|COMPLETED) ]]; do
+            jobs_status="$(aws batch describe-jobs --jobs "${backup_job_id}" | jq -r '.jobs[0].status')"
+            echo "Still waiting for job ${job_name}... Current status is ${jobs_status}."
+            sleep 5
+        done
+
+        if [[ "${jobs_status}" == "FAILED" ]]; then
+          echo "Backup failed. Aborting..."
+          exit 1
+        fi
+====================================================================================================================
+name: DeploymentChoice
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeslot:
+        description: >-
+          Please enter UTC timeslot in the format "YYYY-MM-DD HH:MM:SS".
+        required: false
+        type: string
+      Environment:
+        type: choice
+        required: true
+        description: 'Which environment do you want to deploy for?'
+        options:
+          - 'dev1'
+          - 'dev2'
+          - 'dev3'
+          - 'int'
+          - 'prod'
+      tenants:
+        description: >-
+          Please provide the tenant ids (short form) to deploy as JSON array. (Example:'["pt"]'').
+        required: true
+        default: '["pt"]'
+      version:
+        description: >-
+          Please provide the exact version you want to deploy. (Example:"1.42.1.001").
+        required: true
+      deploy_icon:
+        description: "Deploy icon-app? (iCON UI, batch applications and nemesis service for chosen tenants)"
+        type: boolean
+        default: true
+      deploy_batchconsole:
+        description: "Deploy icon-batchconsole?"
+        type: boolean
+        default: true
+
+jobs:
+  call-pipeline:
+    uses: ./.github/workflows/DeploymentPipeline.yml
+    with:
+      tenants: ${{ inputs.tenants }}
+      timeslot: ${{ inputs.timeslot }}
+      Environment: ${{ inputs.Environment }}
+      version: ${{ inputs.version }}
+      deploy_icon: ${{ inputs.deploy_icon }}
+      deploy_batchconsole: ${{ inputs.deploy_batchconsole }}
+
+=====================================================================================================
+
+name: DeploymentPipeline
+
+on:
+  workflow_call:
+    inputs:
+      timeslot:
+        required: false
+        type: string
+      tenants:
+        required: true
+        type: string
+      Environment:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      deploy_icon:
+        type: boolean
+      deploy_batchconsole:
+        type: boolean
+
+env:
+  ICON_ENVIRONMENT: "${{ inputs.Environment }}"
+
+jobs:
+  init:
+    runs-on: self-hosted
+    outputs:
+      AccountID: ${{ steps.set-env-id.outputs.AccountID }}
+      Stage: ${{ steps.set-env-id.outputs.Stage }}
+    environment: ${{ inputs.Environment }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: set environment id
+        id: set-env-id
+        run: |
+          config_id=$(jq -cr --arg ICON_ENV "${ICON_ENVIRONMENT}" '.[$ICON_ENV].account_id' ./.github/workflows/account_id_config.json)
+          stage=$(jq -cr --arg ICON_ENV "${ICON_ENVIRONMENT}" '.[$ICON_ENV].stage' ./.github/workflows/account_id_config.json)
+          echo "::set-output name=AccountID::"$config_id""
+          echo "::set-output name=Stage::"$stage""
+      - name: Set job summary
+        env:
+          ICON_VERSION: "${{ inputs.version }}"
+          ICON_TENANTS: "${{ inputs.tenants }}"
+        run: |
+          echo "### Deployment to ${ICON_ENVIRONMENT}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Version: ${ICON_VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "Tenants: ${ICON_TENANTS}" >> $GITHUB_STEP_SUMMARY
+
+  plan_icon_app:
+    if: github.event.inputs.deploy_icon == 'true'
+    strategy:
+      matrix:
+        tenant: ${{ fromJSON(github.event.inputs.tenants) }}
+    needs: init
+    runs-on:
+      - self-hosted
+      - ${{ needs.init.outputs.AccountID }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: enable Terraform
+        uses: hashicorp/setup-terraform@v2
+        with: 
+          terraform_version: 1.5.7
+      - name: enable node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.init.outputs.AccountID }}:role/icon-gha-workflow-role
+          role-session-name: "deployment-${{ inputs.Environment }}"
+          aws-region: eu-central-1
+      - name: Verify version exists
+        env:
+          TF_DATA_DIR: '${{ matrix.tenant }}/.terraform'
+          ICON_VERSION: "${{ inputs.version }}"
+          ICON_ACCOUNT_ID: "${{ needs.init.outputs.AccountID }}"
+          ICON_REPOSITORIES: '["iconmb/icon-online","iconmb/icon-batch"]'
+        run: |
+          icon-infrastructure/automation/actions-scripts/verify_tag_exists.sh -i "${ICON_ACCOUNT_ID}" -r "${ICON_REPOSITORIES}" -t "${ICON_VERSION}"
+      - name: plan changes
+        id: plan_changes_icon
+        env:
+          TF_DATA_DIR: '${{ matrix.tenant }}/.terraform'
+          ICON_TENANT: "${{ matrix.tenant }}"
+          ICON_VERSION: "${{ inputs.version }}"
+          ICON_STAGE: "${{ needs.init.outputs.Stage }}"
+        run: |
+            echo "Plan icon application stack changes for tenant: ${ICON_ENVIRONMENT}"
+            terraform init -backend-config="../backend.hcl" -backend-config="${ICON_TENANT}/backend.hcl"
+            terraform plan -var-file="../${ICON_STAGE}.auto.tfvars" -var-file="${ICON_TENANT}/tenant.auto.tfvars" \
+              -out="icon_${ICON_TENANT}.tfplan" -input="false" \
+              -var "container-image-tag=${ICON_VERSION}" \
+        working-directory: "icon-infrastructure/${{ inputs.Environment }}/icon-app/"
+      - uses: actions/upload-artifact@v3
+        with:
+          name: icon_${{ matrix.tenant }}_plan
+          path: icon-infrastructure/${{ inputs.Environment }}/icon-app/icon_${{ matrix.tenant }}.tfplan
+          if-no-files-found: error
+          retention-days: 1
+
+  plan_icon_batchconsole:
+    if: github.event.inputs.deploy_batchconsole == 'true'
+    needs: [init]
+    runs-on:
+      - self-hosted
+      - ${{ needs.init.outputs.AccountID }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: enable Terraform
+        uses: hashicorp/setup-terraform@v2
+        with: 
+          terraform_version: 1.5.7
+      - name: enable node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.init.outputs.AccountID }}:role/icon-gha-workflow-role
+          role-session-name: "deployment-${{ inputs.Environment }}"
+          aws-region: eu-central-1
+      - name: Verify version exists
+        env:
+          TF_DATA_DIR: '${{ matrix.tenant }}/.terraform'
+          ICON_VERSION: "${{ inputs.version }}"
+          ICON_ACCOUNT_ID: "${{ needs.init.outputs.AccountID }}"
+          ICON_REPOSITORIES: '["iconmb/icon-batchconsole"]'
+        run: |
+          icon-infrastructure/automation/actions-scripts/verify_tag_exists.sh -i "${ICON_ACCOUNT_ID}" -r "${ICON_REPOSITORIES}" -t "${ICON_VERSION}"
+      - name: run planning script
+        id: plan_batchconsole
+        env:
+          TF_DATA_DIR: '.'
+          ICON_VERSION: "${{ inputs.version }}"
+          ICON_STAGE: "${{ needs.init.outputs.Stage }}"
+        run: |
+            echo "Plan icon batchconsole changes"
+            terraform init -backend-config='../backend.hcl'
+            terraform plan -var-file="../${ICON_STAGE}.auto.tfvars" \
+              -out="batchconsole.tfplan" -input="false" \
+              -var "icon-container-image-tag=${ICON_VERSION}" \
+              -detailed-exitcode
+        working-directory: "icon-infrastructure/${{ inputs.Environment }}/batchconsole/"
+      - uses: actions/upload-artifact@v3
+        with:
+          name: batchconsole_plan
+          path: icon-infrastructure/${{ inputs.Environment }}/batchconsole/batchconsole.tfplan
+          if-no-files-found: error
+          retention-days: 1
+
+  approvals:
+    needs: [plan_icon_app,plan_icon_batchconsole]
+    if: |
+      !cancelled() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    uses: ./.github/workflows/ApprovalReusable.yml
+    with:
+      target: "${{ inputs.Environment }}-deploy"
+
+  wait-for:
+    if: |
+      !cancelled() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      github.event.inputs.timeslot != ''
+    needs: approvals
+    runs-on: self-hosted
+    timeout-minutes: 1200
+    steps:
+      - name: Get current time in seconds
+        run:  echo "NOW=$(date --utc +%s)" >> $GITHUB_ENV
+      - name: Get timeslot in seconds
+        env:
+          ICON_TIMESLOT: "${{ inputs.timeslot }}"
+        run: |
+          readonly current_datetime_seconds="$(date --utc +%s)"
+          readonly provided_timeslot_seconds="$(date --utc --date="${ICON_TIMESLOT}" +%s)"
+          readonly delta="$((${provided_timeslot_seconds}-${current_datetime_seconds}))"
+          echo "Timeslot to deploy is: ${ICON_TIMESLOT}"
+          if [[ "$delta" -lt 0 ]]; then
+            echo "Provided timeslot already exceeded. Aborting deployment for all tenants..."
+            exit 1
+          else
+            echo "Waiting for $delta seconds before continuing..."
+            sleep "$delta"
+          fi
+
+  deploy_icon_app:
+    strategy:
+      matrix:
+        tenant: ${{ fromJSON(github.event.inputs.tenants) }}
+      fail-fast: false
+    concurrency: "${{ inputs.Environment }}-${{ matrix.tenant }}"
+    if: |
+      !cancelled() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      github.event.inputs.deploy_icon == 'true'
+    needs: [approvals,plan_icon_app,wait-for,init]
+    runs-on:
+      - self-hosted
+      - ${{ needs.init.outputs.AccountID }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: enable Terraform
+        uses: hashicorp/setup-terraform@v2
+        with: 
+          terraform_version: 1.5.7
+      - name: enable node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.init.outputs.AccountID }}:role/icon-gha-workflow-role
+          role-session-name: "deployment-${{ inputs.Environment }}"
+          aws-region: eu-central-1
+      - uses: actions/download-artifact@v3
+        id: icon_plan_download
+        with:
+          name: icon_${{ matrix.tenant }}_plan
+          path: "icon-infrastructure/${{ inputs.Environment }}/icon-app/"
+      - name: disable batches
+        env:
+          ICON_TENANT: "${{ matrix.tenant }}"
+        run: |
+            echo "Disabling batches for tenant: ${ICON_TENANT}"
+            bash ./icon-infrastructure/automation/actions-scripts/disable_batch_queue.sh -q "icon-queue-${ICON_TENANT}"
+      - name: Deploy
+        env:
+          ICON_TENANT: "${{ matrix.tenant }}"
+          TF_DATA_DIR: '${{ matrix.tenant }}/.terraform'
+          ICON_PLANFILE_PATH: "${{ steps.icon_plan_download.outputs.download-path }}/icon_${{ matrix.tenant }}.tfplan"
+        run: |
+            echo "Applying changes for iCON for tenant: ${ICON_TENANT}"
+            terraform init -backend-config="../backend.hcl" -backend-config="${ICON_TENANT}/backend.hcl"
+            echo "Showing changes for iCON for tenant: ${ICON_TENANT}"
+            terraform show "${ICON_PLANFILE_PATH}"
+            echo "Applying changes for iCON for tenant: ${ICON_TENANT}"
+            terraform apply "${ICON_PLANFILE_PATH}"
+        working-directory: "icon-infrastructure/${{ inputs.Environment }}/icon-app/"
+      - name: Re-Enable batch queue
+        env:
+          ICON_TENANT: ${{ matrix.tenant }}
+        run: |
+            echo "Enable batches for tenant: ${ICON_TENANT}"
+            aws batch update-job-queue --job-queue "icon-queue-${ICON_TENANT}" --state "ENABLED" > /dev/null
+
+  deploy_icon_batchconsole:
+      if: |
+        !cancelled() &&
+        !contains(needs.*.result, 'failure') &&
+        !contains(needs.*.result, 'cancelled') &&
+        github.event.inputs.deploy_batchconsole == 'true'
+      needs: [approvals,plan_icon_batchconsole,wait-for,init,deploy_icon_app]
+      runs-on:
+        - self-hosted
+        - ${{ needs.init.outputs.AccountID }}
+      permissions:
+        id-token: write
+        contents: read
+      steps:
+        - name: checkout
+          uses: actions/checkout@v2
+        - name: enable Terraform
+          uses: hashicorp/setup-terraform@v2
+          with: 
+            terraform_version: 1.5.7
+        - name: enable node
+          uses: actions/setup-node@v3
+          with:
+            node-version: '14'
+        - name: configure aws credentials
+          uses: aws-actions/configure-aws-credentials@v2
+          with:
+            role-to-assume: arn:aws:iam::${{ needs.init.outputs.AccountID }}:role/icon-gha-workflow-role
+            role-session-name: "deployment-${{ inputs.Environment }}"
+            aws-region: eu-central-1
+        - uses: actions/download-artifact@v3
+          id: batchconsole_plan_download
+          with:
+            name: batchconsole_plan
+            path: "icon-infrastructure/${{ inputs.Environment }}/batchconsole/"
+        - name: apply batchconsole changes
+          env:
+            TF_DATA_DIR: '.'
+            BATCHCONSOLE_PLANFILE_PATH: "${{ steps.batchconsole_plan_download.outputs.download-path }}/batchconsole.tfplan"
+          run: |
+              terraform init -backend-config=../backend.hcl
+              echo "Showing changes for batchconsole"
+              terraform show "${BATCHCONSOLE_PLANFILE_PATH}"
+              echo "Applying changes for batchconsole"
+              terraform apply "${BATCHCONSOLE_PLANFILE_PATH}"
+          working-directory: "icon-infrastructure/${{ inputs.Environment }}/batchconsole/"
+
+====================================================================================================================================
+# This is a basic workflow that is manually triggered
+
+name: Restart environment
+
+# Controls when the action will run. Workflow runs when manually triggered using the UI
+# or API.
+on:
+  workflow_dispatch:
+    # Inputs the workflow accepts.
+    inputs:
+      Environment:
+        type: choice
+        required: true
+        description: 'In which environment do you want to restart the service?'
+        options:
+          - 'dev1'
+      service-name:
+        description: 'ECS Service Name'
+        required: true
+        type: choice
+        options:
+          -  'icon-online-service-be'
+          -  'icon-online-service-br'
+          -  'icon-online-service-es'
+          -  'icon-online-service-fr'
+          -  'icon-online-service-gb'
+          -  'icon-online-service-it'
+          -  'icon-online-service-pt'
+          -  'icon-online-service-se'
+          
+env:
+  ICON_ENVIRONMENT: "${{ inputs.Environment }}"
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  init:
+    runs-on: self-hosted
+    outputs:
+      AccountID: ${{ steps.set-env-id.outputs.AccountID }}
+      Stage: ${{ steps.set-env-id.outputs.Stage }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: set environment id
+        id: set-env-id
+        run: |
+          config_id=$(jq -cr --arg ICON_ENV "${ICON_ENVIRONMENT}" '.[$ICON_ENV].account_id' ./.github/workflows/account_id_config.json)
+          stage=$(jq -cr --arg ICON_ENV "${ICON_ENVIRONMENT}" '.[$ICON_ENV].stage' ./.github/workflows/account_id_config.json)
+          echo "::set-output name=AccountID::"$config_id""
+          echo "::set-output name=Stage::"$stage""
+      - name: Set job summary
+        env:
+          ICON_SERVICE_NAME: "${{ inputs.service-name }}"
+        run: |
+          echo "### Restarting service on ${ICON_ENVIRONMENT}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "service: ${ICON_SERVICE_NAME}" >> $GITHUB_STEP_SUMMARY
+  
+  restart-env:
+    needs: init
+    runs-on:
+      - self-hosted
+      - ${{ needs.init.outputs.AccountID }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.init.outputs.AccountID }}:role/icon-gha-workflow-role
+          role-session-name: "restart-${{ inputs.service-name }}"
+          aws-region: eu-central-1
+
+      - name: Get task definition family from service name
+        id: family
+        run: |
+          SERVICE_NAME="${{ github.event.inputs.service-name }}"
+          FAMILY=$(echo "$SERVICE_NAME" | sed 's/-service//')
+          echo "family=$FAMILY" >> $GITHUB_OUTPUT
+
+      - name: Get latest task definition ARN
+        id: taskdef
+        run: |
+          FAMILY=${{ steps.family.outputs.family }}
+          LATEST_ARN=$(aws ecs describe-task-definition --task-definition "$FAMILY" --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "taskdef_arn=$LATEST_ARN" >> $GITHUB_OUTPUT
+
+      - name: Restart ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "icon-cluster" \
+            --service "${{ github.event.inputs.service-name }}" \
+            --task-definition "${{ steps.taskdef.outputs.taskdef_arn }}" \
+            --desired-count 1 \
+            --force-new-deployment
+          
+    ================================================================================================
+name: Restore
+
+on:
+  workflow_dispatch:
+    inputs:
+      targetEnvironment:
+        type: choice
+        description: Please choose the environment to restore to
+        options:
+        - dev1
+        - dev2
+        - dev3
+        - int
+        - prod
+      tenants:
+        type: string
+        description: Please provide the tenant ids (short form) to restore as JSON array. (Example:'["pt","br","be"]').
+        required: true
+        default: '["pt"]'
+      sourceEnvironment:
+        type: choice
+        description: Please choose the environment to restore from
+        options:
+        - dev1
+        - dev2
+        - dev3
+        - int
+        - prod
+      after_rr_procedure:
+        type: boolean
+        default: true
+      anonymize:
+        type: boolean
+        default: true
+      restart:
+        description: Restart iCON for respective tenant(s) after restore?
+        type: boolean
+        default: true
+      verification:
+        description: Create inventory list and quantitative summary files and upload them to S3 bucket?
+        type: boolean
+        default: false
+      verification_date:
+        description: "The date for whicht the inventory list should be created. Format example: 20230801. If kept empty, today's date will be used."
+        type: string
+        default: ""
+      timestamp:
+        type: string
+        description: Please provide the UTC timestamp which is part of the backup name. (Example:"2023-07-07-10-00-00")
+        required: true
+        default: ""
+
+jobs:
+  init:
+    runs-on: self-hosted
+    outputs:
+      targetEnvironmentId: ${{ steps.set-env-id.outputs.targetEnvironmentId }}
+      sourceAccountId: ${{ steps.set-env-id.outputs.sourceAccountId }}
+      sourceBucketName: ${{ steps.set-env-id.outputs.sourceBucketName }}
+    environment: ${{ inputs.targetEnvironmentId }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: set environment id
+        id: set-env-id
+        env: 
+          ICON_SOURCE_ENVIRONMENT: ${{ inputs.sourceEnvironment }}
+          ICON_TARGET_ENVIRONMENT: ${{ inputs.targetEnvironment }}
+        run: |
+          target_id=$(jq -cr --arg ICON_ENV "${ICON_TARGET_ENVIRONMENT}" '.[$ICON_ENV].account_id' ./.github/workflows/account_id_config.json)
+          echo "::set-output name=targetEnvironmentId::"$target_id""
+          source_account_id=$(jq -cr --arg ICON_ENV "${ICON_SOURCE_ENVIRONMENT}" '.[$ICON_ENV].account_id' ./.github/workflows/account_id_config.json)
+          echo "::set-output name=sourceAccountId::"$source_account_id""
+          source_bucket=$(jq -cr --arg ICON_ENV "${ICON_SOURCE_ENVIRONMENT}" '.[$ICON_ENV].backups_bucket' ./.github/workflows/account_id_config.json)
+          echo "::set-output name=sourceBucketName::"$source_bucket""
+
+  FindBackups:
+    needs: ['init']
+    runs-on:
+      - self-hosted
+      - ${{ needs.init.outputs.sourceAccountId }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      backupsFound: ${{ steps.identify_backups.outputs.backup_s3_keys }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: arn:aws:iam::${{ needs.init.outputs.sourceAccountId }}:role/icon-gha-workflow-role
+        role-session-name: "find-backups-${{ inputs.Environment }}"
+        aws-region: eu-central-1
+    - name: Identify backups
+      id: identify_backups
+      env: 
+        ICON_TENANTS: "${{ inputs.tenants }}"
+        ICON_BACKUP_TIMESTAMP: "${{ inputs.timestamp }}"
+        ICON_SOURCE_BUCKETNAME: "${{ needs.init.outputs.sourceBucketName }}"
+      run: |
+        echo "Tenants: ${ICON_TENANTS}"
+        echo "Source buckets: ${ICON_SOURCE_BUCKETNAME}"
+        echo "Timestamp used for backup search: ${ICON_BACKUP_TIMESTAMP}"
+
+        found_backups='{}'
+
+        for tenant_id_short in "$(jq -r '.[]' <<< "${ICON_TENANTS}")"; do
+          tenant_id="$(jq -cr --arg TENANT_ID "${tenant_id_short}" '.[$TENANT_ID].tenantid' ./.github/workflows/tenant_config.json)"
+
+          found_keys="$(aws --query "Contents[?contains(Key, '${ICON_BACKUP_TIMESTAMP}')].Key" s3api list-objects-v2 \
+            --prefix "db-backups/${tenant_id}/" --bucket "${ICON_SOURCE_BUCKETNAME}" | jq -c '. // []')"
+
+          count_of_found_keys="$(jq '. | length' <<< "$found_keys")"
+          backup_key=''
+
+          if [[ ${count_of_found_keys} -eq 0 ]]; then
+              echo "No backup found for tenant ${tenant_id_short}."
+              echo "Exiting"
+              exit 1
+          elif [ ${count_of_found_keys} -gt 1 ]; then
+              echo "Multiple backups found for tenant ${tenant_id_short}."
+              echo "${found_keys}"
+              echo "Exiting"
+              exit 1
+          else
+              backup_key="$(jq -r '.[0]' <<< "$found_keys")"
+              echo "Backup found and used for restore of tenant ${tenant_id_short}: ${backup_key}"
+              found_backups="$(jq -c --arg TENANT_ID_SHORT "${tenant_id_short}" --arg BACKUP_KEY "${backup_key}" '. += {($TENANT_ID_SHORT): $BACKUP_KEY}' <<< $found_backups)"
+          fi
+        done
+        echo "Found backups: ${found_backups}"
+        echo "::set-output name=backup_s3_keys::"${found_backups}""
+
+  approval:
+    needs: [init, FindBackups]
+    uses: ./.github/workflows/ApprovalReusable.yml
+    with:
+      target: ${{ inputs.targetEnvironment }}-restore
+      restore_anonymize : ${{ inputs.anonymize }}
+
+  Restore:
+    if: |
+      !cancelled() &&
+      needs.FindBackups.result == 'success' &&
+      needs.approval.result != 'failure' &&
+      needs.approval.result != 'cancelled'
+    strategy:
+      matrix:
+        tenant: ${{ fromJSON(github.event.inputs.tenants) }}
+      fail-fast: false
+    concurrency: "${{ inputs.Environment }}-${{ matrix.tenant }}"
+    needs: ['approval','init','FindBackups']
+    runs-on:
+      - self-hosted
+      - ${{ needs.init.outputs.targetEnvironmentId }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ICON_TENANT: "${{ matrix.tenant }}"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.init.outputs.targetEnvironmentId }}:role/icon-gha-workflow-role
+          role-session-name: "restore-${{ inputs.Environment }}"
+          role-duration-seconds: 28800
+          aws-region: "eu-central-1"
+      - name: Stop iCON services
+        id: stop_services
+        run: |
+            nemesis_replicas="$(aws ecs describe-services --cluster "icon-cluster" --services "icon-nemesis-service-${ICON_TENANT,,}" --query 'services[0].desiredCount')"
+            online_replicas="$(aws ecs describe-services --cluster "icon-cluster" --services "icon-online-service-${ICON_TENANT,,}" --query 'services[0].desiredCount')"
+            echo "::set-output name=nemesis_replicas::"${nemesis_replicas}""
+            echo "::set-output name=online_replicas::"${online_replicas}""
+
+            echo "Stopping icon-nemesis-service for tenant: ${ICON_TENANT,,}"
+            aws ecs update-service --cluster "icon-cluster" --service "icon-nemesis-service-${ICON_TENANT,,}" --desired-count "0" > /dev/null
+            aws ecs wait services-stable --cluster "icon-cluster" --service "icon-nemesis-service-${ICON_TENANT,,}"
+            echo "Stopping icon-online-service for tenant: ${ICON_TENANT,,}"
+            aws ecs update-service --cluster "icon-cluster" --service "icon-online-service-${ICON_TENANT,,}" --desired-count "0" > /dev/null
+            aws ecs wait services-stable --cluster "icon-cluster" --service "icon-online-service-${ICON_TENANT,,}"
+      - name: Disable batch queue
+        run: |
+            echo "Disabling batches for tenant: ${ICON_TENANT,,}"
+            bash ./icon-infrastructure/automation/actions-scripts/disable_batch_queue.sh -q "icon-queue-${ICON_TENANT,,}"
+      - name: Restore
+        env:
+          ICON_SOURCE_ACCOUNT_ID: "${{ needs.init.outputs.sourceAccountId }}"
+          ICON_TARGET_ACCOUNT_ID: "${{ needs.init.outputs.targetEnvironmentId }}"
+          ICON_SOURCE_BUCKETNAME: "${{ needs.init.outputs.sourceBucketName }}"
+          ICON_AFTER_RR: "${{ inputs.after_rr_procedure }}"
+          ICON_ANONYMIZE: "${{ inputs.anonymize }}"
+          ICON_VERIFY: "${{ inputs.verification }}"
+          ICON_VERIFY_DATE: "${{ inputs.verification_date }}"
+          ICON_BACKUPS_FOUND: "${{ needs.FindBackups.outputs.backupsFound }}"
+        run: |
+          set -eE
+          backup_key="$(jq -cr --arg TENANT_ID_SHORT "${ICON_TENANT,,}" '.[$TENANT_ID_SHORT]' <<< "${ICON_BACKUPS_FOUND}")"
+          if [[ -z "$backup_key" ]]; then
+            echo "Backupfile could not be identified. Skipping restore..."
+            exit 0
+          fi
+
+          echo "Running restore with backup: "${backup_key}""
+          echo "After RR procedure: ${ICON_AFTER_RR}"
+          echo "Anonymize: ${ICON_ANONYMIZE}"
+
+          readonly job_name="restore-${ICON_TENANT,,}-$(openssl rand -hex 12)"
+
+          assume_role_arg=''
+          if [[ ! "${ICON_SOURCE_ACCOUNT_ID}" == "${ICON_TARGET_ACCOUNT_ID}" ]]; then
+            assume_role_arg=",\"-a\",\"arn:aws:iam::${ICON_SOURCE_ACCOUNT_ID}:role/db-job-batch-cross-account-source-s3-role\""
+          fi
+
+          varify_arg=''
+          if [[ "${ICON_VERIFY}" == "true" ]]; then
+            varify_arg=",\"-q\""
+          fi
+
+          command_args="[\"-k\",\"${backup_key}\",\"-b\",\"${ICON_SOURCE_BUCKETNAME}\"${assume_role_arg}${varify_arg}]"
+          environment_args="[{\"name\":\"ICON_AFTER_RR\",\"value\":\"${ICON_AFTER_RR}\"},{\"name\":\"ICON_ANONYMIZE\",\"value\":\"${ICON_ANONYMIZE}\"},{\"name\":\"ICON_VERIFICATION_DATE\",\"value\":\"${ICON_VERIFY_DATE}\"}]}"
+
+          readonly container_overrides="{\"command\": $command_args,\"environment\": $environment_args"
+          readonly restore_job_id="$(aws batch submit-job --job-name "$job_name" --job-queue "db-job-queue" \
+            --job-definition "db-restore-${ICON_TENANT,,}" \
+            --container-overrides "${container_overrides}" | jq -r '.jobId')"
+
+          echo "Job name: ${job_name}"
+          echo "Job ID: ${restore_job_id}"
+
+          job_status=''
+
+          echo "Waiting for job: ${job_name}"
+
+          while [[ ! "${job_status}" =~ (SUCCEEDED|FAILED|COMPLETED) ]]; do
+              job_status="$(aws batch describe-jobs --jobs "${restore_job_id}" | jq -r '.jobs[0].status')"
+              echo "Still waiting for job ${job_name}... Current status is ${job_status}."
+              sleep 5
+          done
+          
+          echo "Batch exited with status: ${job_status}"
+
+          if [[ "${jobs_status}" == "FAILED" ]]; then
+            echo "Restore failed. Aborting..."
+            exit 1
+          fi
+      - name: Enable batch queue
+        if: ${{ inputs.restart }}
+        run: |
+            echo "Enable batches for tenant: ${ICON_TENANT,,}"
+            aws batch update-job-queue --job-queue "icon-queue-${ICON_TENANT,,}" --state "ENABLED" > /dev/null
+      - name: Restart iCON services
+        if: ${{ inputs.restart }}
+        env:
+          ICON_ONLINE_REPLICAS: "${{ steps.stop_services.outputs.online_replicas }}"
+          ICON_NEMESIS_REPLICAS: "${{ steps.stop_services.outputs.nemesis_replicas }}"
+        run: |
+            echo "Scaling icon-nemesis-service for tenant ${ICON_TENANT,,} to ${ICON_NEMESIS_REPLICAS}"
+            aws ecs update-service --cluster "icon-cluster" --service "icon-nemesis-service-${ICON_TENANT,,}" --desired-count "${ICON_NEMESIS_REPLICAS}" > /dev/null
+            aws ecs wait services-stable --cluster "icon-cluster" --service "icon-nemesis-service-${ICON_TENANT,,}"
+
+            echo "Starting icon-online-service for tenant ${ICON_TENANT,,} to ${ICON_ONLINE_REPLICAS}"
+            aws ecs update-service --cluster "icon-cluster" --service "icon-online-service-${ICON_TENANT,,}" --desired-count "${ICON_ONLINE_REPLICAS}" > /dev/null
+            aws ecs wait services-stable --cluster "icon-cluster" --service "icon-online-service-${ICON_TENANT,,}"
